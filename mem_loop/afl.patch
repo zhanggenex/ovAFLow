@@ -1,0 +1,373 @@
+diff --git a/.gitignore b/.gitignore
+index 57df30e..38b793f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,11 +10,3 @@ afl-gotcpu
+ afl-showmap
+ afl-tmin
+ as
+-
+-# Binaries produced by "make -C llvm_mode"
+-afl-clang-fast
+-afl-clang-fast++
+-afl-llvm-pass.so
+-afl-llvm-rt-32.o
+-afl-llvm-rt-64.o
+-afl-llvm-rt.o
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 1d94ecb..42ff737 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -145,6 +145,7 @@ static s32 forksrv_pid,               /* PID of the fork server           */
+            out_dir_fd = -1;           /* FD of the lock file              */
+ 
+ EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
++EXP_ST u8* trace_bits_he;                /* SHM_HE with instrumentation bitmap  */
+ 
+ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
+            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
+@@ -153,6 +154,7 @@ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
+ static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
+ 
+ static s32 shm_id;                    /* ID of the SHM region             */
++static s32 shm_id_he;                    /* ID of the SHM_HE region             */
+ 
+ static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
+                    clear_screen = 1,  /* Window resized?                  */
+@@ -892,6 +894,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
+ 
+   u64* current = (u64*)trace_bits;
+   u64* virgin  = (u64*)virgin_map;
++  u64* current_he = (u64*)trace_bits_he;
+ 
+   u32  i = (MAP_SIZE >> 3);
+ 
+@@ -907,6 +910,25 @@ static inline u8 has_new_bits(u8* virgin_map) {
+   u8   ret = 0;
+ 
+   while (i--) {
++  	
++	//check whether trace_bits_he has new.
++	//check whether this test case execute heap related basic blocks
++	//return 1 when hit heap BBs
++	if (unlikely(*current_he)) {
++
++    	if (likely(ret < 2)) {
++
++        	u8* cur_he = (u8*)current_he;
++
++        	if (cur_he[0] || cur_he[1] || cur_he[2] || cur_he[3] ||
++				cur_he[4] || cur_he[5] || cur_he[6] || cur_he[7]) {
++				if (UR(25000) >= 24999)
++					ret = 1;
++			}
++
++      	}
++	}
++
+ 
+     /* Optimize for (*current & *virgin) == 0 - i.e., no bits in current bitmap
+        that have not been already cleared from the virgin map - since this will
+@@ -947,6 +969,8 @@ static inline u8 has_new_bits(u8* virgin_map) {
+     current++;
+     virgin++;
+ 
++    current_he++;
++
+   }
+ 
+   if (ret && virgin_map == virgin_bits) bitmap_changed = 1;
+@@ -1212,6 +1236,7 @@ static inline void classify_counts(u32* mem) {
+ static void remove_shm(void) {
+ 
+   shmctl(shm_id, IPC_RMID, NULL);
++  shmctl(shm_id_he, IPC_RMID, NULL);
+ 
+ }
+ 
+@@ -1353,6 +1378,7 @@ static void cull_queue(void) {
+ EXP_ST void setup_shm(void) {
+ 
+   u8* shm_str;
++  u8* shm_str_he;
+ 
+   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
+ 
+@@ -1363,9 +1389,14 @@ EXP_ST void setup_shm(void) {
+ 
+   if (shm_id < 0) PFATAL("shmget() failed");
+ 
++  shm_id_he = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
++
++  if (shm_id_he < 0) PFATAL("shm_he_get() failed");
++
+   atexit(remove_shm);
+ 
+   shm_str = alloc_printf("%d", shm_id);
++  shm_str_he = alloc_printf("%d", shm_id_he);
+ 
+   /* If somebody is asking us to fuzz instrumented binaries in dumb mode,
+      we don't want them to detect instrumentation, since we won't be sending
+@@ -1373,13 +1404,19 @@ EXP_ST void setup_shm(void) {
+      later on, perhaps? */
+ 
+   if (!dumb_mode) setenv(SHM_ENV_VAR, shm_str, 1);
++  if (!dumb_mode) setenv(SHM_ENV_VAR_HE, shm_str_he, 1);
+ 
+   ck_free(shm_str);
++  ck_free(shm_str_he);
+ 
+   trace_bits = shmat(shm_id, NULL, 0);
+   
+   if (!trace_bits) PFATAL("shmat() failed");
+ 
++  trace_bits_he = shmat(shm_id_he, NULL, 0);
++
++  if (!trace_bits_he) PFATAL("shm_he_at() failed");
++
+ }
+ 
+ 
+@@ -2277,6 +2314,7 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+   int status = 0;
+   u32 tb4;
++  //u32 tb4_he;
+ 
+   child_timed_out = 0;
+ 
+@@ -2285,6 +2323,7 @@ static u8 run_target(char** argv, u32 timeout) {
+      territory. */
+ 
+   memset(trace_bits, 0, MAP_SIZE);
++  memset(trace_bits_he, 0, MAP_SIZE);
+   MEM_BARRIER();
+ 
+   /* If we're running in "dumb" mode, we can't rely on the fork server
+@@ -2440,6 +2479,7 @@ static u8 run_target(char** argv, u32 timeout) {
+   MEM_BARRIER();
+ 
+   tb4 = *(u32*)trace_bits;
++  //tb4_he = *(u32*)trace_bits_he;
+ 
+ #ifdef __x86_64__
+   classify_counts((u64*)trace_bits);
+diff --git a/afl-showmap.c b/afl-showmap.c
+index fe2f979..29cb0fc 100644
+--- a/afl-showmap.c
++++ b/afl-showmap.c
+@@ -56,6 +56,7 @@
+ static s32 child_pid;                 /* PID of the tested program         */
+ 
+ static u8* trace_bits;                /* SHM with instrumentation bitmap   */
++static u8* trace_bits_he;                /* SHM_HE with instrumentation bitmap   */
+ 
+ static u8 *out_file,                  /* Trace output file                 */
+           *doc_path,                  /* Path to docs                      */
+@@ -67,6 +68,7 @@ static u32 exec_tmout;                /* Exec timeout (ms)                 */
+ static u64 mem_limit = MEM_LIMIT;     /* Memory limit (MB)                 */
+ 
+ static s32 shm_id;                    /* ID of the SHM region              */
++static s32 shm_id_he;                    /* ID of the SHM_HE region              */
+ 
+ static u8  quiet_mode,                /* Hide non-essential messages?      */
+            edges_only,                /* Ignore hit counts?                */
+@@ -138,6 +140,7 @@ static void classify_counts(u8* mem, const u8* map) {
+ static void remove_shm(void) {
+ 
+   shmctl(shm_id, IPC_RMID, NULL);
++  shmctl(shm_id_he, IPC_RMID, NULL);
+ 
+ }
+ 
+@@ -147,23 +150,35 @@ static void remove_shm(void) {
+ static void setup_shm(void) {
+ 
+   u8* shm_str;
++  u8* shm_str_he;
+ 
+   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+ 
+   if (shm_id < 0) PFATAL("shmget() failed");
+ 
++  shm_id_he = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
++
++  if (shm_id_he < 0) PFATAL("shm_he_get() failed");
++
+   atexit(remove_shm);
+ 
+   shm_str = alloc_printf("%d", shm_id);
++  shm_str_he = alloc_printf("%d", shm_id_he);
+ 
+   setenv(SHM_ENV_VAR, shm_str, 1);
++  setenv(SHM_ENV_VAR_HE, shm_str_he, 1);
+ 
+   ck_free(shm_str);
++  ck_free(shm_str_he);
+ 
+   trace_bits = shmat(shm_id, NULL, 0);
+   
+   if (!trace_bits) PFATAL("shmat() failed");
+ 
++  trace_bits_he = shmat(shm_id_he, NULL, 0);
++  
++  if (!trace_bits_he) PFATAL("shmat()_he failed");
++
+ }
+ 
+ /* Write results. */
+
+diff --git a/config.h b/config.h
+index 2627cc1..1a9cd4b 100644
+--- a/config.h
++++ b/config.h
+@@ -272,6 +272,7 @@
+ /* Environment variable used to pass SHM ID to the called program. */
+ 
+ #define SHM_ENV_VAR         "__AFL_SHM_ID"
++#define SHM_ENV_VAR_HE         "__AFL_SHM_ID_HE"
+ 
+ /* Other less interesting, internal-only variables. */
+ 
+diff --git a/llvm_mode/Makefile b/llvm_mode/Makefile
+index 7617f91..b9f8c2e 100644
+--- a/llvm_mode/Makefile
++++ b/llvm_mode/Makefile
+@@ -22,7 +22,7 @@ BIN_PATH     = $(PREFIX)/bin
+ 
+ VERSION     = $(shell grep '^\#define VERSION ' ../config.h | cut -d '"' -f2)
+ 
+-LLVM_CONFIG ?= llvm-config
++LLVM_CONFIG ?= /usr/bin/llvm-config-6.0
+ 
+ CFLAGS      ?= -O3 -funroll-loops
+ CFLAGS      += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
+diff --git a/llvm_mode/afl-llvm-pass.so.cc b/llvm_mode/afl-llvm-pass.so.cc
+index 154a5db..4907b0e 100644
+--- a/llvm_mode/afl-llvm-pass.so.cc
++++ b/llvm_mode/afl-llvm-pass.so.cc
+@@ -43,6 +43,7 @@
+ #include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/Support/Debug.h"
++#include <llvm/Support/raw_ostream.h>
+ #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+ 
+ using namespace llvm;
+@@ -103,10 +104,26 @@ bool AFLCoverage::runOnModule(Module &M) {
+   /* Get globals for the SHM region and the previous location. Note that
+      __afl_prev_loc is thread-local. */
+ 
++	//GlobalVariable::GlobalVariable	(	Module & 	M,
++	//Type * 	Ty,
++	//bool 	isConstant,
++	//LinkageTypes 	Linkage,
++	//Constant * 	Initializer,
++	//const Twine & 	Name = "",
++	//GlobalVariable * 	InsertBefore = nullptr,
++	//ThreadLocalMode 	TLMode = NotThreadLocal,
++	//unsigned 	AddressSpace = 0,
++	//bool 	isExternallyInitialized = false 
++	//)
++
+   GlobalVariable *AFLMapPtr =
+       new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
+                          GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
+ 
++  GlobalVariable *AFLMapPtr_He =
++      new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
++                         GlobalValue::ExternalLinkage, 0, "__afl_area_ptr_he");
++
+   GlobalVariable *AFLPrevLoc = new GlobalVariable(
+       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
+       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
+@@ -115,8 +132,8 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+   int inst_blocks = 0;
+ 
+-  for (auto &F : M)
+-    for (auto &BB : F) {
++	for (auto &F : M)
++    	for (auto &BB : F) {	
+ 
+       BasicBlock::iterator IP = BB.getFirstInsertionPt();
+       IRBuilder<> IRB(&(*IP));
+@@ -149,6 +166,34 @@ bool AFLCoverage::runOnModule(Module &M) {
+       Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+       IRB.CreateStore(Incr, MapPtrIdx)
+           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++		  
++		  
++		//update bitmap_he
++		for (auto &INST : BB) {
++			if (CallInst *CI = dyn_cast<CallInst>(&INST)) {
++				if (Function *F = CI->getCalledFunction()) {
++					if (F->getName().str() == "malloc" ||
++						F->getName().str() == "realloc" ||
++						F->getName().str() == "calloc" ||
++						F->getName().str() == "free") {
++							  /* Load SHM_HE pointer */
++
++							  LoadInst *MapPtr_He = IRB.CreateLoad(AFLMapPtr_He);
++							  MapPtr_He->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++							  Value *MapPtrIdx_He =
++								  IRB.CreateGEP(MapPtr_He, IRB.CreateXor(PrevLocCasted, CurLoc));
++
++							  /* Update bitmap */
++
++							  LoadInst *Counter_He = IRB.CreateLoad(MapPtrIdx_He);
++							  Counter_He->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++							  Value *Incr_He = IRB.CreateAdd(Counter_He, ConstantInt::get(Int8Ty, 1));
++							  IRB.CreateStore(Incr_He, MapPtrIdx_He)
++								  ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++					}
++				}
++			}
++		}
+ 
+       /* Set prev_loc to cur_loc >> 1 */
+ 
+diff --git a/llvm_mode/afl-llvm-rt.o.c b/llvm_mode/afl-llvm-rt.o.c
+index 24ddd69..ec0d4ac 100644
+--- a/llvm_mode/afl-llvm-rt.o.c
++++ b/llvm_mode/afl-llvm-rt.o.c
+@@ -59,6 +59,9 @@
+ u8  __afl_area_initial[MAP_SIZE];
+ u8* __afl_area_ptr = __afl_area_initial;
+ 
++u8  __afl_area_initial_he[MAP_SIZE];
++u8* __afl_area_ptr_he = __afl_area_initial_he;
++
+ __thread u32 __afl_prev_loc;
+ 
+ 
+@@ -72,21 +75,28 @@ static u8 is_persistent;
+ static void __afl_map_shm(void) {
+ 
+   u8 *id_str = getenv(SHM_ENV_VAR);
++  u8 *id_str_he = getenv(SHM_ENV_VAR_HE);
+ 
+   /* If we're running under AFL, attach to the appropriate region, replacing the
+      early-stage __afl_area_initial region that is needed to allow some really
+      hacky .init code to work correctly in projects such as OpenSSL. */
+ 
+-  if (id_str) {
++  if (id_str && id_str_he) {
+ 
+     u32 shm_id = atoi(id_str);
+ 
++    u32 shm_id_he = atoi(id_str_he);
++
+     __afl_area_ptr = shmat(shm_id, NULL, 0);
+ 
+     /* Whooooops. */
+ 
+     if (__afl_area_ptr == (void *)-1) _exit(1);
+ 
++    __afl_area_ptr_he = shmat(shm_id_he, NULL, 0);
++
++    if (__afl_area_ptr_he == (void *)-1) _exit(1);
++
+     /* Write something into the bitmap so that even with low AFL_INST_RATIO,
+        our parent doesn't give up on us. */
+ 
